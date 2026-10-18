@@ -1,0 +1,63 @@
+{
+  "device": "NVIDIA H100 NVL",
+  "block_mib": 4.0,
+  "d2h_gibs_at_block": 46.784,
+  "h2d_gibs_at_block": 45.491,
+  "d2h_gibs_asymptotic": 53.113,
+  "h2d_gibs_asymptotic": 51.55,
+  "curve_mib_gibs": {
+    "d2h": [
+      [
+        0.25,
+        16.553
+      ],
+      [
+        1,
+        34.429
+      ],
+      [
+        4,
+        46.784
+      ],
+      [
+        16,
+        51.463
+      ],
+      [
+        64,
+        52.754
+      ],
+      [
+        256,
+        53.113
+      ]
+    ],
+    "h2d": [
+      [
+        0.25,
+        16.848
+      ],
+      [
+        1,
+        33.886
+      ],
+      [
+        4,
+        45.491
+      ],
+      [
+        16,
+        50.012
+      ],
+      [
+        64,
+        51.306
+      ],
+      [
+        256,
+        51.55
+      ]
+    ]
+  },
+  "note": "Measured with torch.cuda.synchronize() after the loop and pinned host memory. Do NOT substitute bytes/shelving_seconds from live runs -- async offload makes that an overestimate."
+}
