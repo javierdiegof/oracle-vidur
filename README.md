@@ -1,168 +1,130 @@
-# Vidur: LLM Inference System Simulator
+# Oracle-Vidur: Agentic KV-Cache Serving & Eviction Simulator
 
-Vidur is a high-fidelity and extensible LLM inference system simulator. It can help you with:
+**CS 598: Hardware and Software for AI — Project (Group 9)**  
+*Hieu Nguyen, Nikunj Mall, Konstantinos Kafousis, Javier Diego*  
+University of Illinois Urbana-Champaign (UIUC)
 
-1. Study the system performance of models under different workloads and configurations.
+---
 
-    | TTFT | TPOT | Request E2E Time | Batch Size |
-    | --- | --- | --- | --- |
-    | ![TTFT](./assets/prefill_e2e_time.png) | ![TPOT](./assets/decode_time_execution_plus_preemption_normalized.png) | ![Request E2E Time](./assets/request_e2e_time.png) | ![Batch Size](./assets/batch_size.png) |
+## 1. Project Overview
 
-    *`Llama-3-8B` running the [AzureLLMInferenceTrace2023_conv](https://github.com/Azure/AzurePublicDataset/blob/master/data/AzureLLMInferenceTrace_conv.csv) trace on single `A100 80GB` at 6.45 QPS*
+Modern Large Language Model (LLM) agents differ fundamentally from conversational chatbots: they frequently invoke external tools (e.g., bash execution, file modifications, database queries, and remote APIs) that introduce extended idle periods. During these tool calls, the agent's KV cache typically sits idle in the GPU's High Bandwidth Memory (HBM). Under multi-agent concurrency and long contexts, HBM saturates, forcing KV caches to be evicted (either via offloading to host DRAM over PCIe or by recomputation).
 
-1. Capacity planning and finding the best deployment configuration for your LLM deployments.
-   ![Config Search](./assets/llama70b_Chat1M_ttft_tbt_90_99_2.0_0.2.jpeg)
-*Capacity per dollar for different deployment configurations vs TTFT-P90 and TBT-P99 for LLaMA2-70B.*
-1. Quickly test new research ideas like new scheduling algorithms, optimizations like speculative decoding, etc.
+**Oracle-Vidur** investigates whether having knowledge of future tool call durations can be leveraged to design an optimal, slack-aware KV cache management policy that alleviates HBM pressure while hiding memory-transfer overheads across the PCIe bus.
 
-... all without access to GPUs except for a quick initial profiling phase 🎉. We highly recommend checking out our [MLSys'24 paper](https://arxiv.org/abs/2405.05465) and [talk](https://mlsys.org/virtual/2024/poster/2667) for more details.
+---
 
+## 2. Codebase Lineage: How We Extend Base Vidur
 
-## Supported Models
+This repository represents the evolution of three distinct development stages:
 
-__Instructions on adding a new model to existing or new SKUs can be found [here](docs/profiling.md)__.
-
-| Model / Device | A100 80GB DGX | H100 DGX | 4xA100 80GB Pairwise NVLink Node | 8xA40 Pairwise NVLink Node |
-| --- | --- | --- | --- | --- |
-| `meta-llama/Meta-Llama-3-8B` | ✅ | ❌ | ✅ | ❌ |
-| `meta-llama/Meta-Llama-3-70B` | ✅ | ❌ | ✅ | ❌ |
-| `meta-llama/Llama-2-7b-hf` | ✅ | ✅ | ✅ | ✅ |
-| `codellama/CodeLlama-34b-Instruct-hf"` | ✅ | ✅ | ✅ | ✅ |
-| `meta-llama/Llama-2-70b-hf` | ✅ | ✅ | ✅ | ✅ |
-| `internlm/internlm-20b` | ✅ | ✅ | ✅ | ✅ |
-| `Qwen/Qwen-72B` | ✅ | ✅ | ✅ | ✅ |
-
-* All models support a maximum context length of 4k except `Llama3-8B` and `Llama3-70B` which support 16k context length by passing additional CLI params:
-
-    ```text
-    --random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size 16384 \
-    --random_forrest_execution_time_predictor_config_prediction_max_batch_size 512 \
-    --random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request 16384
-    ```
-
-* Pipeline parallelism is supported for all models. The PP dimension should divide the number of layers in the model.
-* In DGX nodes, there are 8 GPUs, fully connected via NVLink. So TP1, TP2, TP4 and TP8 are supported.
-* In 4x pairwise NVLink nodes, there are 4 GPUs, so TP1, TP2 and TP4 are supported. TP4 here is less performant than TP4 in DGX nodes because (GPU1, GPU2) are connected via NVLink and (GPU3, GPU4) are connected via NVLink. but between these layers, the interconnect is slower.
-* You can use any combination of TP and PP. For example, you can run LLaMA2-70B on TP2-PP2 on a 4xA100 80GB Pairwise NVLink Node.
-
-## Setup
-
-### Using `mamba`
-
-To run the simulator, create a mamba environment with the given dependency file.
-
-```sh
-mamba env create -p ./env -f ./environment.yml
-mamba env update -f environment-dev.yml
+```
+[Upstream Microsoft Vidur]  -->  [Labmate's extended-vidur]  -->  [oracle-vidur (This Project)]
+  - Single-turn batch serving      - Multi-turn agent lifecycle     - Real SWE-bench tool wait traces
+  - HBM only (abort/restart)       - Basic PCIe & DRAM tiering      - Full-duplex PCIe serialization
+  - No tool-call idle states       - Continuum TTL / Pinning        - LRU / FIFO on-demand baselines
+                                                                    - Verified memory contention suite
+                                                                    - Slack-aware Oracle & JIT reload
 ```
 
-### Using `venv`
+### Layer 1: Upstream Microsoft Vidur (`vidur-cache`)
+* **What it was designed for**: Profiling and simulating single-turn LLM serving systems (prompt prefill $\to$ decode until EOS).
+* **Why it could not support agentic research**:
+  * **Static request model**: Requests in `vidur/entities/request.py` only contain static `num_prefill_tokens` and `num_decode_tokens`. There is no concept of multi-turn conversation loops or intermediate pauses.
+  * **No Host DRAM or PCIe modeling**: Vidur only models GPU HBM blocks. When memory runs out, `vllm_replica_scheduler.py` simply restarts preempted requests (`victim_request.restart()`), discarding all work and recomputing from scratch. There is zero host memory tier and zero bus transfer delay.
 
-1. Ensure that you have Python 3.10 installed on your system. Refer <https://www.bitecode.dev/p/installing-python-the-bare-minimum>
-2. `cd` into the repository root
-3. Create a virtual environment using `venv` module using `python3.10 -m venv .venv`
-4. Activate the virtual environment using `source .venv/bin/activate`
-5. Install the dependencies using `python -m pip install -r requirements.txt`
-6. Run `deactivate` to deactivate the virtual environment
+### Layer 2: Labmate's Extensions (`extended-vidur` / `AgenticServingSim`)
+* Built by our labmate (Rishabh Ravi) using Vidur's core scientific methodology (GPU execution-time cost modeling) to create a custom discrete-event simulator:
+  * **Multi-turn Agent Representation**: Introduced `RequestTrace`, `IterSpec`, and `Live` request lifecycles.
+  * **Tool Wait Idle State**: Added `St.TOOL` where an agent goes idle off-GPU between turns.
+  * **Basic Hardware Link**: Added an initial `PCIeLink` modeling finite CPU-GPU transfer bandwidth.
+  * **Agentic Baselines**: Implemented early models of Continuum (TTL pinning), vLLM prefix-caching, and LMCache.
 
-### Using `conda` (Least recommended)
+### Layer 3: Our Contributions in `oracle-vidur`
+Our project introduces the full experimental pipeline, hardware upgrades, and eviction mechanisms required for our research proposal:
+1. **Real SWE-bench Ingestion with Exact Tool Wait Times (`tools/ingest_openhands.py`)**:
+   * Ingests real autonomous software engineering traces from `OpenHands/openhands-evaluation-outputs` on SWE-bench Lite.
+   * Extracts exact per-turn token usage and microsecond tool execution durations ($\Delta t = \text{timestamp}_{\text{obs}} - \text{timestamp}_{\text{act}}$).
+2. **Full-Duplex PCIe Bus Modeling (`sim/scheduler_sim.py`)**:
+   * Upgraded `PCIeLink` from half-duplex serialization to a true **full-duplex serial bus** with concurrent Device-to-Host (D2H offload) and Host-to-Device (H2D reload) queues.
+3. **On-Demand Baseline Eviction Policies (`sim/baseline_sim.py`)**:
+   * **KV Retention**: Suspended agents maintain their KV cache resident in HBM across tool calls.
+   * **Contention Triggers**: Under admission or decode growth pressure ($C_{\text{free}} < S_{\text{req}}$), tool-waiting sessions are dynamically evicted to Host DRAM.
+   * **Eviction Policies**: Implemented **LRU** (longest idle in HBM) and **FIFO** (earliest arrival in HBM) victim selection rules.
+   * **PCIe Reload Accounting**: On-demand reload upon tool completion, capturing inter-turn TTFT stalls ($\text{TTFT}_{\text{turn}} = t_{\text{first\_token}} - \tau_{\text{tool\_finish}}$).
+4. **Memory Contention Verification Suite (`sim/verify_evictions.py`)**:
+   * Systematically sweeps arrival rates ($\lambda$) and HBM KV pool budgets ($C_{\text{HBM}}$), proving that the workload drives the GPU to 100% capacity and forces active evictions.
 
-To run the simulator, create a conda environment with the given dependency file.
+---
 
-```sh
-conda env create -p ./env -f ./environment.yml
-conda env update -f environment-dev.yml
+## 3. Repository Structure
+
+```
+oracle-vidur/
+├── data/
+│   └── swebench_traces.jsonl       # Real SWE-bench agent execution traces
+├── tools/
+│   └── ingest_openhands.py         # Downloader & parser for OpenHands evaluation outputs
+├── sim/
+│   ├── scheduler_sim.py            # Core discrete-event simulation engine & full-duplex PCIeLink
+│   ├── admission_scheduler.py      # Slot-based request queue & admission control
+│   ├── pin_sim.py                  # KV pinning and pool budget mechanics
+│   ├── baseline_sim.py             # Baseline LRU and FIFO on-demand eviction simulator
+│   └── verify_evictions.py         # Multi-configuration memory contention & eviction sweep runner
+├── results/
+│   ├── sim_calibration.json        # Calibrated PCIe transfer bandwidth (D2H & H2D)
+│   └── sim_costmodel_h100_0905b.json # Profiling-calibrated continuous batching cost model
+├── vidur/                          # Upstream Vidur components (preserved for reference/lineage)
+└── README.md                       # Main project documentation
 ```
 
-### Setting up wandb (Optional)
+---
 
-First, setup your account on `https://<your-org>.wandb.io/` or public wandb, obtain the api key and then run the following command,
+## 4. Verified Memory Contention & Baseline Results
 
-```sh
-wandb login --host https://<your-org>.wandb.io
+To confirm that the SWE-bench workload and memory hierarchy induce real GPU memory pressure, we executed `sim/verify_evictions.py` across five configurations:
+
+| Policy | KV HBM Budget | Arrival Rate $\lambda$ | Sim Time | Peak HBM Util % | Total Evictions | Evicted Volume | Reload Stalls | p99 Reload Stall |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **LRU** | 32 GB | 0.05 req/s | 1000.0s | **99.9%** | **11** | 23.42 GB | 9 | 0.105s |
+| **LRU** | 16 GB | 0.10 req/s | 1000.4s | **100.0%** | **23** | 29.79 GB | 17 | 0.072s |
+| **LRU** | 12 GB | 0.15 req/s | 1000.4s | **100.0%** | **26** | 33.57 GB | 17 | 0.067s |
+| **LRU** | 8 GB | 0.20 req/s | 1000.3s | **99.9%** | **23** | 22.94 GB | 20 | 0.064s |
+| **FIFO** | 8 GB | 0.20 req/s | 1000.3s | **99.9%** | **23** | 22.94 GB | 20 | 0.064s |
+
+### Key Experimental Takeaways:
+1. **Sustained Contention**: Peak HBM utilization consistently hits **99.9% – 100.0%**, confirming that concurrent SWE-bench agents saturate available GPU memory.
+2. **Measurable Eviction Activity**: Over **106 evictions** and **132 GB of KV caches** were offloaded across the sweep.
+3. **Pipeline Stalls Demonstrated**: Sessions whose KV caches were offloaded suffered measurable PCIe reload stalls upon tool return, directly impacting turn-to-turn latency.
+
+---
+
+## 5. Quickstart: Running the Pipeline
+
+### 1. Ingest Real Agent Traces
+To download and parse SWE-bench Lite runs from OpenHands into simulation format:
+```bash
+python3 tools/ingest_openhands.py data/swebench_traces.jsonl 30
 ```
 
-To opt out of wandb, pick any one of the following methods:
-
-1. `export WANDB_MODE=disabled` in your shell or add this in `~/.zshrc` or `~/.bashrc`. Remember to reload using `source ~/.zshrc`.
-2. Set `wandb_project` and `wandb_group` as `""` in `vidur/config/default.yml`. Also, remove these CLI params from the shell command with which the simulator is invoked.
-
-## Running the simulator
-
-To run the simulator, execute the following command from the repository root,
-
-```sh
-python -m vidur.main
+### 2. Run the Eviction Verification Suite
+To execute the multi-rate, multi-budget memory contention sweep:
+```bash
+python3 sim/verify_evictions.py
 ```
 
-or a big example with all the parameters,
+---
 
-```sh
-python -m vidur.main  \
---replica_config_device a100 \
---replica_config_model_name meta-llama/Meta-Llama-3-8B \
---cluster_config_num_replicas 1 \
---replica_config_tensor_parallel_size 1 \
---replica_config_num_pipeline_stages 1 \
---request_generator_config_type synthetic \
---synthetic_request_generator_config_num_requests 512  \
---length_generator_config_type trace \
---trace_request_length_generator_config_max_tokens 16384 \
---trace_request_length_generator_config_trace_file ./data/processed_traces/splitwise_conv.csv \
---interval_generator_config_type poisson \
---poisson_request_interval_generator_config_qps 6.45 \
---replica_scheduler_config_type sarathi  \
---sarathi_scheduler_config_batch_size_cap 512  \
---sarathi_scheduler_config_chunk_size 512 \
---random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size 16384 \
---random_forrest_execution_time_predictor_config_prediction_max_batch_size 512 \
---random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request 16384
-```
+## 6. Project Roadmap
 
-or to get information on all parameters,
-
-```sh
-python -m vidur.main -h
-```
-
-## Simulator Output
-
-* The metrics will be logged to wandb directly and a copy will be stored in the `simulator_output/<TIMESTAMP>` directory. __A description of all the logged metrics can be found [here](docs/metrics.md).__
-* Vidur exports chrome traces of each simulation. The trace can be found in the `simulator_output` directory. The trace can be opened by navigating to `chrome://tracing/` or `edge://tracing/` and loading the trace.
-
-    ![Chrome Trace](./assets/chrome_trace.png)
-
-## Formatting Code
-
-To format code, execute the following command:
-
-```sh
-make format
-```
-
-## Using Canary Build
-
-We have been working on several improvements for the simulator, including support for prefix caching, different routing policies, reducing memory requirements for the simulator, etc. However, there are some sharp edges that we are working on resolving. In the meantime, if you are looking for support for any of these features, please use the `canary` branch.
-
-## Contributing
-
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
-
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
-
+With memory contention and baseline evictions verified:
+* [x] Ingest multi-turn SWE-bench traces with real tool-wait times.
+* [x] Implement full-duplex PCIe bus and Host DRAM offload/reload tiering.
+* [x] Implement baseline on-demand LRU and FIFO eviction policies.
+* [x] Confirm active memory contention and pipeline reload stalls under load.
+* [ ] **Implement Oracle Slack-Aware Victim Selection** (Eq. 4):
+  $$\rho_j(t) = S_j(t) \cdot [\Delta t_j(t) - T_{\text{RTT}}(j)]$$
+* [ ] **Implement Emergency Fallback (Bélády Rule)** (Eq. 5):
+  $$v^* = \arg\max_{j \in W} \Delta t_j(t)$$
+* [ ] **Implement Slack-Aware Just-in-Time (JIT) Reloading** (Eq. 6–7) with Earliest-Deadline-First dispatching to hide reload latency.
+* [ ] **Benchmark Oracle vs. Baselines**: Evaluate reduction in p99 inter-turn TTFT stalls.
