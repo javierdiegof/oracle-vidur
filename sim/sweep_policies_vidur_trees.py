@@ -77,13 +77,31 @@ def create_vidur_predictor(device: str = "a100", model: str = "meta-llama/Llama-
     return predictor
 
 
-def load_openhands_traces(path: str = "data/swebench_traces.jsonl") -> list[RequestTrace]:
+def load_openhands_traces(
+    path: str = "data/swebench_traces.jsonl",
+    tool_wait_filter: str = "all",     # "all", "short_wait" (<=0.25s), "long_wait" (>=0.50s)
+    length_filter: str = "all"         # "all", "short" (<=15 turns), "long" (>=25 turns)
+) -> list[RequestTrace]:
     traces = []
     with open(path) as f:
         for line in f:
             if not line.strip():
                 continue
             d = json.loads(line)
+
+            num_turns = d.get("num_turns", len(d.get("iters", [])))
+            avg_tool = d.get("avg_tool_time", 0.0)
+
+            if length_filter == "short" and num_turns > 15:
+                continue
+            elif length_filter == "long" and num_turns < 25:
+                continue
+
+            if tool_wait_filter == "short_wait" and avg_tool > 0.25:
+                continue
+            elif tool_wait_filter == "long_wait" and avg_tool < 0.50:
+                continue
+
             iters = [
                 IterSpec(
                     tokens_added=it["tokens_added"],

@@ -76,25 +76,33 @@ def parse_instance(line: str) -> dict | None:
     if not iters:
         return None
 
+    tool_times = [it["tool_time"] for it in iters]
+    avg_tool_time = sum(tool_times) / len(tool_times) if tool_times else 0.0
+    total_tool_time = sum(tool_times)
+    max_tokens = max(it["ctx_tokens"] for it in iters) if iters else prev_ctx
+
     return {
         "session_id": instance_id,
         "num_turns": len(iters),
         "total_tokens": prev_ctx,
+        "max_tokens": max_tokens,
+        "avg_tool_time": round(avg_tool_time, 2),
+        "total_tool_time": round(total_tool_time, 2),
         "iters": iters
     }
 
 
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else "data/swebench_traces.jsonl"
-    max_instances = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+    max_instances = int(sys.argv[2]) if len(sys.argv) > 2 else 350
 
-    print(f"[Ingest] Fetching OpenHands SWE-bench Lite dataset from Hugging Face...")
+    print(f"[Ingest] Fetching full OpenHands SWE-bench Lite dataset from Hugging Face...")
     req = urllib.request.Request(DATASET_URL, headers={"User-Agent": "Mozilla/5.0"})
 
     records = []
     with urllib.request.urlopen(req) as resp:
         for idx, line in enumerate(resp):
-            if idx >= max_instances:
+            if max_instances and idx >= max_instances:
                 break
             line_str = line.decode("utf-8").strip()
             if not line_str:
@@ -102,7 +110,8 @@ def main():
             parsed = parse_instance(line_str)
             if parsed and parsed["iters"]:
                 records.append(parsed)
-                print(f"  Parsed {parsed['session_id']}: {parsed['num_turns']} turns, final context {parsed['total_tokens']} tokens")
+                if len(records) % 25 == 0 or len(records) <= 5:
+                    print(f"  Parsed {len(records)}: {parsed['session_id']} ({parsed['num_turns']} turns, avg_tool={parsed['avg_tool_time']}s, max_ctx={parsed['max_tokens']})")
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
