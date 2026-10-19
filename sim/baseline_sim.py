@@ -61,6 +61,12 @@ class BaselineEvictionSim(PinSim):
         self.inter_turn_ttft_samples: list[float] = []
         self.peak_hbm_blocks = 0
 
+        # Memory Utilization & Multiplexing Telemetry
+        self.total_hbm_block_seconds = 0.0
+        self.total_dram_saved_block_seconds = 0.0
+        self.total_virtual_block_seconds = 0.0
+        self.peak_virtual_blocks = 0
+
     @property
     def allocated_blocks(self) -> int:
         return self.M - len(self._vllm_free_blocks)
@@ -169,3 +175,17 @@ class BaselineEvictionSim(PinSim):
             return
 
         super()._handle(ev)
+
+    def advance_once(self, horizon: float = float("inf")) -> bool:
+        t_prev = self.now
+        ret = super().advance_once(horizon)
+        dt = self.now - t_prev
+        if dt > 0:
+            alloc_b = self.allocated_blocks
+            self.total_hbm_block_seconds += alloc_b * dt
+            dram_b = sum(e["blocks"] for e in self.offloaded_dram.values())
+            self.total_dram_saved_block_seconds += dram_b * dt
+            virt_b = alloc_b + dram_b
+            self.total_virtual_block_seconds += virt_b * dt
+            self.peak_virtual_blocks = max(self.peak_virtual_blocks, virt_b)
+        return ret

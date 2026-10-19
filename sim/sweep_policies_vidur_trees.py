@@ -156,6 +156,13 @@ def run_single_config(
     p50_stall = stalls[len(stalls) // 2] if stalls else 0.0
     p99_stall = stalls[int(len(stalls) * 0.99)] if stalls else 0.0
 
+    avg_hbm_gb = (sim.total_hbm_block_seconds * geom.bytes_per_block) / (sim.now * (1024**3))
+    avg_hbm_util_pct = (sim.total_hbm_block_seconds / (sim.now * max(1, sim.M))) * 100.0
+    gb_hours_saved = (sim.total_dram_saved_block_seconds * geom.bytes_per_block) / ((1024**3) * 3600.0)
+    avg_virt_gb = (sim.total_virtual_block_seconds * geom.bytes_per_block) / (sim.now * (1024**3))
+    mux_ratio = avg_virt_gb / max(0.1, kv_hbm_gb)
+    peak_mux_ratio = sim.peak_virtual_blocks / max(1, sim.M)
+
     return {
         "policy": policy,
         "kv_hbm_gb": kv_hbm_gb,
@@ -163,7 +170,12 @@ def run_single_config(
         "completed": f"{done_count}/{total_count}",
         "sim_time_s": sim.now,
         "wall_time_s": wall_duration,
+        "avg_hbm_gb": avg_hbm_gb,
+        "avg_hbm_util_pct": avg_hbm_util_pct,
         "peak_hbm_util_pct": (sim.peak_hbm_blocks / max(1, sim.M)) * 100.0,
+        "mux_ratio": mux_ratio,
+        "peak_mux_ratio": peak_mux_ratio,
+        "gb_hours_saved": gb_hours_saved,
         "total_evictions": sim.total_evictions,
         "evicted_gb": sim.total_evicted_bytes / (1024**3),
         "total_reloads": sim.total_reloads,
@@ -191,15 +203,15 @@ def main():
     ]
 
     header = (
-        f"{'Policy':<6} | {'KV HBM':<7} | {'Rate λ':<7} | {'Done':<6} | {'SimTime':<8} | "
-        f"{'Peak Util %':<11} | {'Evictions':<10} | {'Evicted GB':<11} | "
-        f"{'Reload Stalls':<13} | {'p99 Stall':<10} | {'Wall Time':<9}"
+        f"{'Policy':<6} | {'KV HBM':<7} | {'Avg HBM (Util %)':<18} | "
+        f"{'Mux Ratio (Avg/Pk)':<19} | {'HBM-hrs Saved':<14} | "
+        f"{'Evictions':<10} | {'Evicted GB':<11} | {'Stalls':<7} | {'p99 Stall':<10} | {'SimTime':<8}"
     )
-    print("=" * 138)
+    print("=" * 144)
     print("5-CONFIGURATION MEMORY CONTENTION SWEEP (DRIVEN BY ACTUAL VIDUR PREDICTOR)")
-    print("=" * 138)
+    print("=" * 144)
     print(header)
-    print("-" * 138)
+    print("-" * 144)
 
     results = []
     total_wall_start = time.perf_counter()
@@ -216,30 +228,32 @@ def main():
             max_time=50000.0
         )
         results.append(res)
+        avg_hbm_str = f"{res['avg_hbm_gb']:.1f}G ({res['avg_hbm_util_pct']:.1f}%)"
+        mux_str = f"{res['mux_ratio']:.2f}x / {res['peak_mux_ratio']:.2f}x"
         row = (
             f"{res['policy'].upper():<6} | "
             f"{res['kv_hbm_gb']:>4.0f} GB | "
-            f"{res['rate']:>7.2f} | "
-            f"{res['completed']:<6} | "
-            f"{res['sim_time_s']:>7.1f}s | "
-            f"{res['peak_hbm_util_pct']:>10.1f}% | "
+            f"{avg_hbm_str:<18} | "
+            f"{mux_str:<19} | "
+            f"{res['gb_hours_saved']:>9.2f} GB-h | "
             f"{res['total_evictions']:>10d} | "
             f"{res['evicted_gb']:>9.2f} GB | "
-            f"{res['reload_stalls_count']:>13d} | "
+            f"{res['reload_stalls_count']:>7d} | "
             f"{res['p99_reload_stall_s']:>8.3f}s | "
-            f"{res['wall_time_s']:>7.2f}s"
+            f"{res['sim_time_s']:>7.1f}s"
         )
         print(row)
 
     total_wall_sweep = time.perf_counter() - total_wall_start
-    print("=" * 128)
+    print("=" * 144)
     print(f"\n[SWEEP SUMMARY]")
     total_evictions = sum(r['total_evictions'] for r in results)
     total_evicted_gb = sum(r['evicted_gb'] for r in results)
+    total_saved_hours = sum(r['gb_hours_saved'] for r in results)
     print(f"Total Sweep Execution Time: {total_wall_sweep:.2f} seconds")
     print(f"Total Evictions Triggered:  {total_evictions}")
     print(f"Total KV Data Offloaded:    {total_evicted_gb:.2f} GB over PCIe")
-    print(f"Peak HBM Utilization:       99.9% - 100.0% across all constrained configs")
+    print(f"Total HBM-Hours Saved:      {total_saved_hours:.2f} GB-hours offloaded to Host DRAM")
 
 
 if __name__ == "__main__":
