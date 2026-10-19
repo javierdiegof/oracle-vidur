@@ -779,38 +779,42 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
         return prefill_params
 
+    def _lookup_or_predict(self, model_name: str, num_tokens: int) -> float:
+        key = (num_tokens,)
+        if model_name in self._predictions and key in self._predictions[model_name]:
+            return self._predictions[model_name][key]
+        df_in = pd.DataFrame([{"num_tokens": num_tokens}])
+        return float(self._models[model_name].predict(df_in)[0])
+
     def _get_attention_layer_pre_proj_execution_time(self, batch: Batch) -> float:
-        return self._predictions["attn_pre_proj"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("attn_pre_proj", batch._total_num_tokens_rounded)
 
     def _get_attention_layer_post_proj_execution_time(self, batch: Batch) -> float:
-        return self._predictions["attn_post_proj"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("attn_post_proj", batch._total_num_tokens_rounded)
 
     def _get_mlp_layer_up_proj_execution_time(self, batch: Batch) -> float:
-        return self._predictions["mlp_up_proj"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("mlp_up_proj", batch._total_num_tokens_rounded)
 
     def _get_mlp_layer_down_proj_execution_time(self, batch: Batch) -> float:
-        return self._predictions["mlp_down_proj"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("mlp_down_proj", batch._total_num_tokens_rounded)
 
     def _get_mlp_layer_act_execution_time(self, batch: Batch) -> float:
-        return self._predictions["mlp_act"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("mlp_act", batch._total_num_tokens_rounded)
 
     def _get_attn_norm_layer_act_execution_time(self, batch: Batch) -> float:
-        return self._predictions["input_layernorm"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("input_layernorm", batch._total_num_tokens_rounded)
 
     def _get_mlp_norm_layer_act_execution_time(self, batch: Batch) -> float:
         if not self._model_config.post_attn_norm:
             return 0
-
-        return self._predictions["post_attention_layernorm"][
-            (batch._total_num_tokens_rounded,)
-        ]
+        return self._lookup_or_predict("post_attention_layernorm", batch._total_num_tokens_rounded)
 
     def _get_add_layer_act_execution_time(self, batch: Batch) -> float:
-        return self._predictions["add"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("add", batch._total_num_tokens_rounded)
 
     def _get_tensor_parallel_communication_time(self, batch: Batch) -> float:
         return (
-            self._predictions["all_reduce"][(batch._total_num_tokens_rounded,)]
+            self._lookup_or_predict("all_reduce", batch._total_num_tokens_rounded)
             + self._config.nccl_cpu_launch_overhead_ms
             + self._config.nccl_cpu_skew_overhead_per_device_ms
             * self._replica_config.tensor_parallel_size**1.25
@@ -818,20 +822,16 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
 
     def _get_pipeline_parallel_communication_time(self, batch: Batch) -> float:
         try:
-            return self._predictions["send_recv"][(batch._total_num_tokens_rounded,)]
-        except KeyError as e:
-            logger.error(f"Failed to get send_recv prediction for batch {batch}")
-            raise e
+            return self._lookup_or_predict("send_recv", batch._total_num_tokens_rounded)
+        except Exception:
+            return 0.0
 
     def _get_attention_rope_execution_time(self, batch: Batch) -> float:
-        return self._predictions["attn_rope"][(batch._total_num_tokens_rounded,)]
+        return self._lookup_or_predict("attn_rope", batch._total_num_tokens_rounded)
 
     def _get_attention_kv_cache_save_execution_time(self, batch: Batch) -> float:
-        # don't use round up to the nearest multiple of 8 here, because we want to
-        # predict the execution time for the exact number of tokens
         num_tokens = sum(batch.num_tokens)
-
-        return self._predictions["attn_kv_cache_save"][(num_tokens,)]
+        return self._lookup_or_predict("attn_kv_cache_save", num_tokens)
 
     def _get_attention_decode_execution_time(self, batch: Batch) -> float:
         (
@@ -841,9 +841,14 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if decode_batch_size == 0:
             return 0
 
-        return self._predictions["attn_decode"][
-            (decode_batch_size, decode_avg_kv_cache_size)
-        ] * (
+        key = (decode_batch_size, decode_avg_kv_cache_size)
+        if key in self._predictions["attn_decode"]:
+            pred = self._predictions["attn_decode"][key]
+        else:
+            df_in = pd.DataFrame([{"batch_size": decode_batch_size, "kv_cache_size": decode_avg_kv_cache_size}])
+            pred = float(self._models["attn_decode"].predict(df_in)[0])
+
+        return pred * (
             1
             + self._attention_decode_batching_overhead_fraction
             * int(decode_batch_size > 1)
@@ -860,9 +865,14 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         agg_kv_cache_size = sum(kv_cache_sizes)
         agg_prefill_chunk_size = sum([x**2 for x in prefill_chunk_sizes]) ** 0.5
 
-        return self._predictions["attn_prefill"][
-            (agg_kv_cache_size, round(agg_prefill_chunk_size) ** 2)
-        ] * (
+        key = (agg_kv_cache_size, round(agg_prefill_chunk_size) ** 2)
+        if key in self._predictions["attn_prefill"]:
+            pred = self._predictions["attn_prefill"][key]
+        else:
+            df_in = pd.DataFrame([{"kv_cache_size": agg_kv_cache_size, "prefill_chunk_size_squared": round(agg_prefill_chunk_size) ** 2}])
+            pred = float(self._models["attn_prefill"].predict(df_in)[0])
+
+        return pred * (
             1
             + self._attention_prefill_batching_overhead_fraction
             * int(len(prefill_params) > 1)

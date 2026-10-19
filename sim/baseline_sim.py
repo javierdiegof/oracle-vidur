@@ -70,14 +70,13 @@ class BaselineEvictionSim(PinSim):
         return len(self._vllm_free_blocks)
 
     def _force_unpin(self, protect: Live | None) -> bool:
-        """Select an eviction victim among tool-waiting sessions based on the policy."""
+        """Select an eviction victim among tool-waiting and waiting sessions based on the policy."""
         candidates = [
-            lv for lv in self.pinned.values()
-            if lv is not protect and lv.state == St.TOOL and lv.runtime_id not in self.offloaded_dram and len(lv.vllm_block_ids) > 0
+            lv for lv in self.live
+            if lv is not protect and lv.state in (St.TOOL, St.WAITING)
+            and lv.runtime_id not in self.offloaded_dram
+            and len(lv.vllm_block_ids) > 0
         ]
-        if not candidates:
-            # Fallback to any pinned request if none in St.TOOL
-            candidates = [lv for lv in self.pinned.values() if lv is not protect and len(lv.vllm_block_ids) > 0]
         if not candidates:
             return False
 
@@ -125,32 +124,48 @@ class BaselineEvictionSim(PinSim):
 
     def _prepare_decode_growth(self) -> bool:
         self.peak_hbm_blocks = max(self.peak_hbm_blocks, self.allocated_blocks)
+        for lv in (x for x in self.live if x.state == St.DECODE):
+            before = self.geom.blocks_for_tokens(lv.gpu_cached_tokens)
+            after = self.geom.blocks_for_tokens(lv.gpu_cached_tokens + 1)
+            grow = after - before
+            while grow > len(self._vllm_free_blocks):
+                if not self._force_unpin(lv):
+                    break
         return super()._prepare_decode_growth()
 
     def _handle(self, ev: _Ev) -> None:
         lv = ev.live
         if ev.kind == "tool_done":
-            # Session is returning from tool wait
-            if isinstance(lv, Live) and lv.runtime_id in self.offloaded_dram:
-                dram_entry = self.offloaded_dram.pop(lv.runtime_id)
-                self.total_reloads += 1
-
-                # On-demand reload over PCIe Host-to-Device (H2D)
-                reload_finish = self.link.submit(dram_entry["bytes"], self.now, direction="h2d")
-
-                if reload_finish > self.now:
-                    # Pipeline stall waiting for PCIe transmission to finish
-                    stall = reload_finish - self.now
-                    self.total_reload_stalls += 1
-                    self.total_stall_seconds += stall
-                    self.inter_turn_ttft_samples.append(stall)
-                    lv.state = St.STALL
-                    # Schedule completion of reload before turn can start
-                    heapq.heappush(self._heap, _Ev(reload_finish, "reload_done", lv))
+            # Advance iteration index and check for completion
+            super()._handle(ev)
+            if isinstance(lv, Live):
+                if lv.state == St.DONE:
+                    self.offloaded_dram.pop(lv.runtime_id, None)
                     return
+                if lv.runtime_id in self.offloaded_dram:
+                    dram_entry = self.offloaded_dram.pop(lv.runtime_id)
+                    self.total_reloads += 1
+
+                    # On-demand reload over PCIe Host-to-Device (H2D)
+                    reload_finish = self.link.submit(dram_entry["bytes"], self.now, direction="h2d")
+
+                    if reload_finish > self.now:
+                        stall = reload_finish - self.now
+                        self.total_reload_stalls += 1
+                        self.total_stall_seconds += stall
+                        self.inter_turn_ttft_samples.append(stall)
+                        lv.state = St.STALL
+                        self._push(reload_finish, "reload_done", lv)
+                        return
+                    else:
+                        lv.state = St.WAITING
+                        self._reconcile()
+            return
 
         elif ev.kind == "reload_done":
             if isinstance(lv, Live):
                 lv.state = St.WAITING
+                self._reconcile()
+            return
 
         super()._handle(ev)
