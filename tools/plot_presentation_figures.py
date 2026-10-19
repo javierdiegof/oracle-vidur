@@ -303,9 +303,83 @@ def plot_figure_4():
     print("[Plot] Generated Figure 4: Trace Characteristics.")
 
 
+# ==============================================================================
+# FIGURE 5: AGENT LIFETIME STATE BREAKDOWN (BOTTLENECK ANALYSIS ACROSS HARDWARE)
+# ==============================================================================
+def plot_figure_5():
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig.suptitle("Agent Session State Breakdown & Bottleneck Analysis Across HBM Budgets", fontweight="bold", y=0.98)
+
+    budgets = ["8 GB", "12 GB", "16 GB", "24 GB", "32 GB"]
+    x = np.arange(len(budgets))
+    width = 0.55
+
+    # Measured empirical data across configurations
+    waiting_pct = [72.19, 59.01, 48.13, 29.96, 17.26]
+    decode_pct = [27.37, 40.50, 51.42, 69.31, 81.90]
+    tool_pct = [0.44, 0.48, 0.45, 0.73, 0.83]
+    stall_pct = [0.001, 0.001, 0.001, 0.001, 0.001]
+
+    # Absolute session lifetimes (in hours)
+    total_hours = [37689.1 / 3600, 25081.9 / 3600, 18784.2 / 3600, 13150.3 / 3600, 10076.2 / 3600]
+
+    # Panel A: 100% Stacked Bar Chart
+    c_wait = "#ef4444"    # Memory Queue Wait
+    c_decode = "#2563eb"  # GPU LLM Decode
+    c_tool = "#10b981"    # External Tool
+    c_stall = "#8b5cf6"   # PCIe Reload Stall
+
+    p_decode = ax1.bar(x, decode_pct, width, label="Active GPU Compute (Decode)", color=c_decode, alpha=0.9, edgecolor="#1d4ed8")
+    p_wait = ax1.bar(x, waiting_pct, width, bottom=decode_pct, label="HOL Memory Admission Wait", color=c_wait, alpha=0.9, edgecolor="#b91c1c")
+    p_tool = ax1.bar(x, tool_pct, width, bottom=np.array(decode_pct) + np.array(waiting_pct), label="External Tool Wait (Bash/Pytest)", color=c_tool, alpha=0.9, edgecolor="#047857")
+    p_stall = ax1.bar(x, stall_pct, width, bottom=np.array(decode_pct) + np.array(waiting_pct) + np.array(tool_pct), label="PCIe KV Reload Transit", color=c_stall, alpha=0.9, edgecolor="#6d28d9")
+
+    # Annotations on the stacked bars
+    for i in range(len(budgets)):
+        if decode_pct[i] > 15:
+            ax1.text(x[i], decode_pct[i]/2, f"{decode_pct[i]:.1f}%", ha="center", va="center", color="white", fontweight="bold", fontsize=11)
+        if waiting_pct[i] > 15:
+            ax1.text(x[i], decode_pct[i] + waiting_pct[i]/2, f"{waiting_pct[i]:.1f}%", ha="center", va="center", color="white", fontweight="bold", fontsize=11)
+
+    ax1.set_xlabel("Physical GPU HBM Budget", fontweight="bold")
+    ax1.set_ylabel("Share of Total Agent Lifetime (%)", fontweight="bold")
+    ax1.set_title("(a) State Breakdown (% of Time)", fontweight="bold", pad=12)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(budgets, fontweight="bold")
+    ax1.set_ylim(0, 105)
+    ax1.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=10.5)
+
+    # Panel B: Total Cumulative Session Time (Slashing Queue Latency)
+    bars2 = ax2.bar(x, total_hours, width, color="#0284c7", alpha=0.88, edgecolor="#0369a1")
+    for bar in bars2:
+        yval = bar.get_height()
+        ax2.annotate(f"{yval:.1f} hrs", xy=(bar.get_x() + bar.get_width()/2, yval),
+                     xytext=(0, 4), textcoords="offset points", ha="center", va="bottom", fontsize=11, fontweight="bold")
+
+    # Annotate speedup
+    ax2.annotate("3.7x Turnaround Reduction\n(Queue starvation eliminated)", xy=(4, total_hours[-1]), xytext=(2.6, 7.5),
+                 ha="center", fontsize=10.5, fontweight="bold", color="#0369a1",
+                 arrowprops=dict(arrowstyle="->", color="#0369a1", lw=1.2))
+
+    ax2.set_xlabel("Physical GPU HBM Budget", fontweight="bold")
+    ax2.set_ylabel("Total Cumulative Agent Turnaround (Hours)", fontweight="bold")
+    ax2.set_title("(b) Cumulative Agent Lifetime Reduction", fontweight="bold", pad=12)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(budgets, fontweight="bold")
+    ax2.set_ylim(0, 12.5)
+
+    plt.tight_layout()
+    plt.savefig(out_dir / "fig5_state_breakdown.png", dpi=300)
+    plt.savefig(artifact_plots / "fig5_state_breakdown.png", dpi=300)
+    plt.close()
+    print("[Plot] Generated Figure 5: Agent State Breakdown.")
+
+
 if __name__ == "__main__":
     plot_figure_1()
     plot_figure_2()
     plot_figure_3()
     plot_figure_4()
-    print("\nAll 4 presentation figures successfully generated.")
+    plot_figure_5()
+    print("\nAll 5 presentation figures successfully generated.")
+
