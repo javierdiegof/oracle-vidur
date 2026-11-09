@@ -121,11 +121,21 @@ class BaselineEvictionSim(PinSim):
 
     def _admit_full(self, lv: Live, headroom: int = 0) -> bool:
         """Evict tool-waiting sessions if free HBM is insufficient to admit this request."""
+        if self._seq_cap_full():
+            return False
         target = self._target_tokens(lv)
-        needed = self.geom.blocks_for_tokens(target) + headroom
+        if lv.runtime_id in self.pinned:
+            # Resident pinned session keeps its KV blocks; only request incremental growth.
+            needed = max(0, self.geom.blocks_for_tokens(target) - len(lv.vllm_block_ids)) + headroom
+        elif self.unpinned_cache:
+            needed = self._blocks_needed(lv) + headroom
+        else:
+            needed = self.geom.blocks_for_tokens(target) + headroom
         while len(self._vllm_free_blocks) < needed:
             if not self._force_unpin(lv):
                 break
+            if self.unpinned_cache and lv.runtime_id not in self.pinned:
+                needed = self._blocks_needed(lv) + headroom
         return super()._admit_full(lv, headroom)
 
     def _prepare_decode_growth(self) -> bool:
