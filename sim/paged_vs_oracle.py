@@ -18,11 +18,19 @@ class TTFTTrackerMixin:
 
     def _init_tracker(self) -> None:
         self.turn_ttft_samples: list[float] = []
+        self.turn_ttft_breakdown: list[tuple[float, float, float, float]] = []
         self.reload_hbm_waits: list[float] = []
         self.total_tool_returns: int = 0
         self.total_prefill_tokens: int = 0
         self.state_seconds: dict[str, float] = {
             "PREFILL": 0.0, "DECODE": 0.0, "TOOL": 0.0, "STALL": 0.0, "WAITING": 0.0
+        }
+        self.residency_seconds: dict[str, float] = {
+            "active_compute": 0.0,
+            "tool_full_hbm": 0.0,
+            "tool_partial_hbm": 0.0,
+            "tool_offloaded_only": 0.0,
+            "active_wall": 0.0,
         }
 
     def advance_once(self, horizon: float = float("inf")) -> bool:
@@ -30,10 +38,31 @@ class TTFTTrackerMixin:
         ret = super().advance_once(horizon)
         dt = self.now - t_prev
         if dt > 0:
+            off = getattr(self, "offloaded_dram", {})
+            any_live = False
             for lv in self.live:
                 name = lv.state.name
                 if name in self.state_seconds:
                     self.state_seconds[name] += dt
+                if getattr(lv, "_last_tool_done_at", None) is not None and name in ("WAITING", "STALL", "PREFILL"):
+                    parts = getattr(lv, "_turn_ttft_parts", None)
+                    if parts is not None:
+                        parts[name] += dt
+                if lv.state != St.DONE:
+                    any_live = True
+                if lv.state in (St.PREFILL, St.DECODE):
+                    self.residency_seconds["active_compute"] += dt
+                elif lv.state == St.TOOL:
+                    n_blk = len(lv.vllm_block_ids)
+                    in_dram = lv.runtime_id in off
+                    if n_blk > 0 and not in_dram:
+                        self.residency_seconds["tool_full_hbm"] += dt
+                    elif n_blk > 0 and in_dram:
+                        self.residency_seconds["tool_partial_hbm"] += dt
+                    else:
+                        self.residency_seconds["tool_offloaded_only"] += dt
+            if any_live:
+                self.residency_seconds["active_wall"] += dt
         return ret
 
     def _start_iter(self, lv: Live) -> None:
@@ -44,12 +73,17 @@ class TTFTTrackerMixin:
         if lv.state != St.DONE:
             self.total_tool_returns += 1
             lv._last_tool_done_at = self.now
+            lv._turn_ttft_parts = {"WAITING": 0.0, "STALL": 0.0, "PREFILL": 0.0}
 
     def _on_step_track(self) -> None:
         for lv in self.live:
             if lv.state == St.DECODE and getattr(lv, "_last_tool_done_at", None) is not None:
-                self.turn_ttft_samples.append(self.now - lv._last_tool_done_at)
+                tot = self.now - lv._last_tool_done_at
+                self.turn_ttft_samples.append(tot)
+                p = getattr(lv, "_turn_ttft_parts", None) or {"WAITING": 0.0, "STALL": 0.0, "PREFILL": 0.0}
+                self.turn_ttft_breakdown.append((tot, p["WAITING"], p["STALL"], p["PREFILL"]))
                 lv._last_tool_done_at = None
+                lv._turn_ttft_parts = None
 
     def summary(self) -> dict:
         import numpy as np
@@ -59,6 +93,24 @@ class TTFTTrackerMixin:
         hbm_w = sorted(self.reload_hbm_waits)
         last_done = max((lv.completion for lv in self.live if lv.completion is not None), default=0.0)
         mean_e2e = float(np.mean(self.latencies)) if self.latencies else 0.0
+        bd = sorted(getattr(self, "turn_ttft_breakdown", []), key=lambda x: x[0])
+        if bd:
+            top1_idx = max(0, int(0.99 * (len(bd) - 1)))
+            top1 = bd[top1_idx:]
+            decomp = {
+                "mean_wait": float(np.mean([x[1] for x in bd])),
+                "mean_stall": float(np.mean([x[2] for x in bd])),
+                "mean_prefill": float(np.mean([x[3] for x in bd])),
+                "p99_wait": float(np.mean([x[1] for x in top1])),
+                "p99_stall": float(np.mean([x[2] for x in top1])),
+                "p99_prefill": float(np.mean([x[3] for x in top1])),
+                "p50": float(np.percentile(ttfts, 50)),
+                "p90": float(np.percentile(ttfts, 90)),
+                "p95": float(np.percentile(ttfts, 95)),
+                "p99": float(np.percentile(ttfts, 99)),
+            }
+        else:
+            decomp = {k: 0.0 for k in ("mean_wait", "mean_stall", "mean_prefill", "p99_wait", "p99_stall", "p99_prefill", "p50", "p90", "p95", "p99")}
         return {
             "done": done,
             "total_requests": len(self.live),
@@ -78,6 +130,8 @@ class TTFTTrackerMixin:
             "pcie_stall_s": self.total_stall_seconds,
             "total_prefill_tokens": self.total_prefill_tokens,
             "state_seconds": dict(self.state_seconds),
+            "residency_seconds": dict(self.residency_seconds),
+            "ttft_decomp": decomp,
         }
 
 
@@ -918,10 +972,18 @@ class RecomputeVLLMSim(TTFTTrackerMixin, Sim):
         self.state_seconds = {
             "WAITING": 0.0, "PREFILL": 0.0, "DECODE": 0.0, "TOOL": 0.0, "STALL": 0.0
         }
+        self.residency_seconds = {
+            "active_compute": 0.0,
+            "tool_full_hbm": 0.0,
+            "tool_partial_hbm": 0.0,
+            "tool_offloaded_only": 0.0,
+            "active_wall": 0.0,
+        }
         self.total_prefill_tokens = 0
         self.total_decode_tokens = 0
         self.inter_turn_ttft_samples = []
         self.turn_ttft_samples = []
+        self.turn_ttft_breakdown = []
         self.reload_hbm_waits = []
         self.total_tool_returns = 0
         self.total_evictions = 0
