@@ -446,10 +446,11 @@ class FullConversationOracleSim(TTFTTrackerMixin, BaselineEvictionSim):
                     lv._reload_wait_start = self.now
             return
         if ev.kind == "reload_done" and isinstance(lv, Live):
-            if getattr(lv, "_reload_wait_start", None) is None:
-                lv._reload_wait_start = self.now
-            lv.state = St.WAITING
-            self._reconcile()
+            if lv.state == St.STALL:
+                if getattr(lv, "_reload_wait_start", None) is None:
+                    lv._reload_wait_start = self.now
+                lv.state = St.WAITING
+                self._reconcile()
             return
         super(BaselineEvictionSim, self)._handle(ev)
 
@@ -616,10 +617,11 @@ class NaivePagedLRUSim(TTFTTrackerMixin, BaselineEvictionSim):
                     lv._reload_wait_start = self.now
             return
         if ev.kind == "reload_done" and isinstance(lv, Live):
-            if getattr(lv, "_reload_wait_start", None) is None:
-                lv._reload_wait_start = self.now
-            lv.state = St.WAITING
-            self._reconcile()
+            if lv.state == St.STALL:
+                if getattr(lv, "_reload_wait_start", None) is None:
+                    lv._reload_wait_start = self.now
+                lv.state = St.WAITING
+                self._reconcile()
             return
         super(BaselineEvictionSim, self)._handle(ev)
 
@@ -903,10 +905,11 @@ class PagedOracleSim(TTFTTrackerMixin, BaselineEvictionSim):
                     lv._reload_wait_start = self.now
             return
         if ev.kind == "reload_done" and isinstance(lv, Live):
-            if getattr(lv, "_reload_wait_start", None) is None:
-                lv._reload_wait_start = self.now
-            lv.state = St.WAITING
-            self._reconcile()
+            if lv.state == St.STALL:
+                if getattr(lv, "_reload_wait_start", None) is None:
+                    lv._reload_wait_start = self.now
+                lv.state = St.WAITING
+                self._reconcile()
             return
         super(BaselineEvictionSim, self)._handle(ev)
 
@@ -1058,16 +1061,26 @@ class CappedPagedOracleSim(CappedConcurrencyMixin, PagedOracleSim):
 
 def run_capped_sim(task: tuple) -> tuple[str, dict]:
     """Worker-safe helper for ProcessPoolExecutor running capped/baseline policies."""
-    import random
+    import copy, random
     from sim.scheduler_sim import KVGeometry, CostModel, PCIeLink, poisson_arrivals
     from sim.verify_evictions import load_openhands_traces
 
     label, base_policy, kv_hbm_gb, rate, n_requests, seed, max_time, trace_path, kw = task
+    kw = dict(kw)
+    tool_scale = float(kw.pop("tool_scale", 1.0))
+    resident_scale = float(kw.pop("resident_scale", 1.0))
     traces = load_openhands_traces(trace_path)
     geom = KVGeometry(layers=32)
     cost = CostModel.from_calibration("results/sim_costmodel_h100_0905b.json")
+    if resident_scale != 1.0:
+        cost.a_resident *= resident_scale
     rng = random.Random(seed)
     sampled = [rng.choice(traces) for _ in range(n_requests)]
+    if tool_scale != 1.0:
+        sampled = copy.deepcopy(sampled)
+        for tr in sampled:
+            for it in tr.iters:
+                it.tool_time *= tool_scale
     arrivals = poisson_arrivals(n_requests, rate=rate, seed=seed)
     link = PCIeLink.from_calibration("results/sim_calibration.json")
     if base_policy == "CappedPagedOracle":
