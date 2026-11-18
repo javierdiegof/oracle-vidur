@@ -28,6 +28,8 @@ from sim.coop_sim import run_coop_sim  # noqa: E402
 TRACE = "data/external_traces/exgentic_swebench.jsonl"
 N_REQ, MAX_TIME = 40, 8000.0
 SEEDS = [1, 2, 3, 4, 5, 42]
+DEV_SEEDS = [100, 101, 102, 103]                       # tuning only
+EVAL_SEEDS = list(range(1, 21)) + [42]                 # 21 held-out workloads
 HBMS = [48.0, 64.0]
 R_CAP = 300_000                         # the notebook's selected R_bw*
 
@@ -79,6 +81,24 @@ EXPERIMENTS = {
         "turn-FIFO, no cap, backfill": ("Coop", dict(COOP_REPL, r_cap=None, order="age", backfill=True)),
         "turn-FIFO + hard cap 300K": ("Coop", dict(COOP_REPL, r_cap=R_CAP, order="age")),
     }),
+    # 7. preemption fix, TUNING ONLY on dev seeds (never reported as results)
+    "fixdev": dict(rates=[0.15], seeds=DEV_SEEDS, configs={
+        "Cap Oracle (300K)": ("CapOracle", {"r_cap": R_CAP}),
+        "Uncapped Oracle": ("PagedOracle", {}),
+        "Cap Oracle B_cap=12": ("CapOracle", {"b_cap": 12}),
+        **{f"D={d:g} pf={int(pf)} guard={g}": ("Coop", dict(COOP, urgent_s=d, preempt_first=pf, guard_frac=g))
+           for d in (0.0, 1.0) for pf in (False, True) for g in (None, 0.85, 0.9, 0.95, 1.0)},
+    }),
+    # 8. held-out evaluation of the fix on 21 workloads (guard 1.0, D=1 chosen on fixdev)
+    "fix": dict(rates=[0.15], seeds=EVAL_SEEDS, configs={
+        "Uncapped Oracle": ("PagedOracle", {}),
+        "Cap Oracle (300K)": ("CapOracle", {"r_cap": R_CAP}),
+        "Cap Oracle B_cap=12": ("CapOracle", {"b_cap": 12}),
+        "turn-FIFO, no cap": ("Coop", dict(COOP_REPL, r_cap=None, order="age")),
+        "Coop (original)": ("Coop", COOP),
+        "Coop + guard": ("Coop", dict(COOP, guard_frac=1.0)),
+        "Coop sched + guard, LRU repl": ("CoopSchedLRU", dict(COOP_SCHED, guard_frac=1.0)),
+    }),
 }
 
 
@@ -88,7 +108,7 @@ def tasks_for(name: str) -> list[tuple]:
     for rate in e["rates"]:
         for label, (pol, kw) in e["configs"].items():
             for hbm in HBMS:
-                for seed in SEEDS:
+                for seed in e.get("seeds", SEEDS):
                     key = f"{name}|{label}|{hbm:.0f}|{rate}|{seed}"
                     out.append((key, pol, hbm, rate, N_REQ, seed, MAX_TIME, TRACE, kw))
     return out

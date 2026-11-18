@@ -72,6 +72,34 @@ class TurnMetricsMixin:
 
         self.link.submit = _submit  # pass-through counter; timing unchanged
 
+        # whole-turn latency (ready -> LLM call finished) and post-preemption waits:
+        # a preempted request has already emitted its first token, so the time it
+        # then spends re-queued is invisible to TTFT but not to E2E.
+        self.turn_lat_rows: list[tuple] = []     # (latency, preempted_in_turn)
+        self.preempt_waits: list[float] = []
+
+    def _handle(self, ev) -> None:
+        if isinstance(ev.live, Live) and ev.kind in ("arrival", "tool_done"):
+            ev.live._m_turn_ready = self.now
+            ev.live._m_turn_preempted = False
+        super()._handle(ev)
+
+    def _finish_llm(self, lv: Live):
+        ready = getattr(lv, "_m_turn_ready", None)
+        if ready is not None:
+            self.turn_lat_rows.append((self.now - ready, bool(getattr(lv, "_m_turn_preempted", False))))
+            lv._m_turn_ready = None
+        super()._finish_llm(lv)
+
+    def _preempt_for_growth(self, requester: Live, deficit: int) -> bool:
+        before = [x for x in self.live if x.state in (St.PREFILL, St.DECODE)]
+        ok = super()._preempt_for_growth(requester, deficit)
+        for x in before:
+            if x.state == St.WAITING and getattr(x, "_m_pre_t", None) is None:
+                x._m_pre_t = self.now
+                x._m_turn_preempted = True
+        return ok
+
     def _on_tool_done_track(self, lv: Live) -> None:
         super()._on_tool_done_track(lv)
         lv._m_admit = None
@@ -79,7 +107,11 @@ class TurnMetricsMixin:
 
     def _start_iter(self, lv: Live) -> None:
         first = lv.it_idx == 0 and not getattr(lv, "_m_started", False)
+        pre_t = getattr(lv, "_m_pre_t", None)
         super()._start_iter(lv)
+        if pre_t is not None and lv.state != St.WAITING:
+            self.preempt_waits.append(self.now - pre_t)
+            lv._m_pre_t = None
         if first and lv.state != St.WAITING:
             lv._m_started = True
             self.first_turn_waits.append(self.now - lv.arrival)
@@ -159,6 +191,15 @@ class TurnMetricsMixin:
         if self.first_turn_waits:
             out["first_turn_wait_mean"] = float(np.mean(self.first_turn_waits))
             out["first_turn_wait_p99"] = float(np.percentile(self.first_turn_waits, 99))
+        if self.turn_lat_rows:
+            L = np.array([r[0] for r in self.turn_lat_rows])
+            out["turn_lat_p50"] = float(np.percentile(L, 50))
+            out["turn_lat_p99"] = float(np.percentile(L, 99))
+            out["turn_lat_mean"] = float(L.mean())
+            out["turns_preempted_frac"] = float(np.mean([r[1] for r in self.turn_lat_rows]))
+        out["preempt_wait_per_conv"] = float(sum(self.preempt_waits)) / max(1, len(self.live))
+        out["preempt_wait_p99"] = float(np.percentile(self.preempt_waits, 99)) if self.preempt_waits else 0.0
+        out["preempt_wait_max"] = float(max(self.preempt_waits)) if self.preempt_waits else 0.0
         out["preemptions"] = int(getattr(self, "vllm_preemptions", 0))
         out["recompute_tokens"] = int(sum(lv.wasted_kv_tokens for lv in self.live))
         out["prefill_tokens_total"] = int(sum(lv.reprefilled_tokens for lv in self.live))
@@ -184,8 +225,21 @@ class CoopSchedulerMixin:
                  cap_mode: str = "hard", r_hard: int | None = None,
                  r_hard_frac: float | None = None,
                  backfill: bool = False, cost_weight: float = 0.0,
-                 reserve: str = "urgent_only", ewma_alpha: float = 0.05, **kwargs):
+                 reserve: str = "urgent_only", ewma_alpha: float = 0.05,
+                 preempt_first: bool = False, guard_frac: float | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        # preempt_first: a preempted turn keeps its turn's ready time and goes to
+        #   the head of the queue (vLLM puts preempted requests at the front).
+        #   Without it the turn's _ready_at is already cleared, so it re-queues as a
+        #   fresh NON-urgent turn behind every urgent one and under the hard r_cap.
+        # guard_frac: an urgent turn may exceed r_cap only while non-evictable KV
+        #   (PREFILL/DECODE/STALL/in-flight reload blocks) + the candidate + expected
+        #   decode growth stays <= guard_frac * HBM, so the overflow cannot force
+        #   recompute preemptions.
+        self.co_preempt_first = preempt_first
+        self.co_guard_frac = guard_frac
+        self.co_g_hat = 256.0          # EWMA tokens generated per turn
+        self.co_guard_blocked = 0
         assert order in ("age", "index")
         assert cap_mode in ("hard", "soft")
         assert reserve in ("urgent_only", "strict", "drain")
@@ -220,9 +274,40 @@ class CoopSchedulerMixin:
         # set BEFORE the base handler: a tool_done can admit the request inside it
         if isinstance(ev.live, Live) and ev.kind in ("arrival", "tool_done"):
             ev.live._ready_at = self.now
+            ev.live._co_turn_ready = self.now
         super()._handle(ev)
 
+    def _preempt_for_growth(self, requester: Live, deficit: int) -> bool:
+        before = [x for x in self.live if x.state in (St.PREFILL, St.DECODE)]
+        ok = super()._preempt_for_growth(requester, deficit)
+        if self.co_preempt_first:
+            for x in before:
+                if x.state == St.WAITING and x.preempted:
+                    x._ready_at = getattr(x, "_co_turn_ready", self.now)
+                    x._co_preempted_wait = True
+        return ok
+
+    def _finish_llm(self, lv: Live):
+        a = self.co_alpha
+        self.co_g_hat = (1 - a) * self.co_g_hat + a * max(0, lv.generated_so_far)
+        super()._finish_llm(lv)
+
+    def _co_guard_ok(self, candidate) -> bool:
+        bt = self.geom.block_tokens
+        held = sum(len(x.vllm_block_ids) for x in self.live
+                   if x.state in (St.PREFILL, St.DECODE, St.STALL)
+                   or x.runtime_id in getattr(self, "inflight_reloads", {}))
+        n_act = sum(1 for x in self.live if x.state in (St.PREFILL, St.DECODE))
+        need = held * bt + self._target_tokens(candidate) + self.co_g_hat * (n_act + 1)
+        return need <= self.co_guard_frac * self.M * bt
+
     def _start_iter(self, lv: Live) -> None:
+        if getattr(lv, "_co_preempted_wait", False):
+            super()._start_iter(lv)            # preemption waits are not fed into q_hat
+            if lv.state != St.WAITING:
+                lv._co_preempted_wait = False
+                lv._ready_at = None
+            return
         ready = getattr(lv, "_ready_at", None)
         super()._start_iter(lv)
         if ready is not None and lv.state != St.WAITING:
@@ -257,6 +342,8 @@ class CoopSchedulerMixin:
             def key(x):
                 ready = getattr(x, "_ready_at", None)
                 ready = x.arrival if ready is None else ready
+                if getattr(x, "_co_preempted_wait", False):
+                    return (-1, ready)
                 if self._co_is_urgent(x):
                     return (0, ready)
                 if self.co_order == "index":
@@ -275,6 +362,12 @@ class CoopSchedulerMixin:
     # -- soft cap -------------------------------------------------------------- #
     def _cap_reached(self, candidate=None) -> bool:
         if self._co_urgent_now and self.co_cap_mode == "soft":
+            if self.co_guard_frac is not None and candidate is not None:
+                if not super()._cap_reached(candidate):
+                    return False                 # within r_cap: no overflow needed
+                if not self._co_guard_ok(candidate):
+                    self.co_guard_blocked += 1
+                    return True
             if self.co_r_hard is None:
                 return False
             act = self._active_runnable()
@@ -332,6 +425,7 @@ class CoopSchedulerMixin:
             urgent_admits=self.co_urgent_admits, over_cap_admits=self.co_over_cap_admits,
             backfills=self.co_backfills, hbm_blocked_urgent=self.co_hbm_blocked_urgent,
             cap_blocked_urgent=self.co_cap_blocked_urgent, r_hard=self.co_r_hard,
+            guard_blocked=self.co_guard_blocked,
             q_hat_final=self.co_q_hat, h_hat_final=self.co_h_hat)
         return s
 
