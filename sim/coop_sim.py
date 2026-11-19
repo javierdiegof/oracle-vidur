@@ -591,6 +591,35 @@ class CoopSchedLRUSim(CoopSchedulerMixin, CappedConcurrencyMixin, NaivePagedLRUS
     """Cooperative scheduler on top of (unchanged) paged-LRU replacement."""
 
 
+class AntiOracleMixin:
+    """ADVERSARIAL replacement (a lower bound, never a proposed policy).
+
+    Same reactive paged mechanics as NaivePagedLRUSim, but evicts the KV that is
+    needed SOONEST: queued (WAITING) turns first, oldest-ready first, then
+    conversations in a tool call whose tool returns soonest (the reverse of Belady)."""
+
+    def _push(self, time, kind, live=None):
+        if kind == "tool_done" and isinstance(live, Live):
+            live._anti_tool_done_at = time
+        super()._push(time, kind, live)
+
+    def _lru_victim_key(self, lv):
+        if lv.state == St.WAITING:
+            ready = getattr(lv, "_ready_at", None)
+            return (0, lv.arrival if ready is None else ready)
+        return (1, getattr(lv, "_anti_tool_done_at", self.now))
+
+
+class CoopSchedDropSim(CoopSchedulerMixin, CappedConcurrencyMixin, NaivePagedLRUSim):
+    """FIFO/coop scheduler + LRU victim order, but evicted KV is DROPPED and re-prefilled
+    on the next admission (vLLM prefix-cache eviction, no CPU offload tier)."""
+    drop_on_evict = True
+
+
+class CoopSchedAntiSim(AntiOracleMixin, CoopSchedulerMixin, CappedConcurrencyMixin, NaivePagedLRUSim):
+    """Cooperative/FIFO scheduler on top of adversarial (anti-Belady) replacement."""
+
+
 # Measured variants: identical metrics wrapper for every policy.
 class M_FullLRU(TurnMetricsMixin, BaselineFullLRUSim): pass
 class M_PagedLRU(TurnMetricsMixin, NaivePagedLRUSim): pass
@@ -599,6 +628,8 @@ class M_CapLRU(TurnMetricsMixin, CappedNaivePagedLRUSim): pass
 class M_CapOracle(TurnMetricsMixin, CappedPagedOracleSim): pass
 class M_Coop(TurnMetricsMixin, CoopSim): pass
 class M_CoopSchedLRU(TurnMetricsMixin, CoopSchedLRUSim): pass
+class M_CoopSchedAnti(TurnMetricsMixin, CoopSchedAntiSim): pass
+class M_CoopSchedDrop(TurnMetricsMixin, CoopSchedDropSim): pass
 
 
 POLICIES = {
@@ -609,6 +640,8 @@ POLICIES = {
     "CapOracle": M_CapOracle,
     "Coop": M_Coop,
     "CoopSchedLRU": M_CoopSchedLRU,
+    "CoopSchedAnti": M_CoopSchedAnti,
+    "CoopSchedDrop": M_CoopSchedDrop,
 }
 
 
@@ -632,8 +665,16 @@ def run_coop_sim(task: tuple) -> tuple[str, dict]:
     geom = KVGeometry(layers=32)
     cost = CostModel.from_calibration("results/sim_costmodel_h100_0905b.json")
     link = PCIeLink.from_calibration("results/sim_calibration.json")
+    kw = dict(kw)
+    bw_scale = float(kw.pop("_bw_scale", 1.0))
+    if bw_scale != 1.0:
+        # BOUND experiments only (labelled as such): scale the calibrated link
+        # identically in both directions. Never used for a policy's own result.
+        link.gbytes_per_sec *= bw_scale
+        if link.d2h_gbytes_per_sec: link.d2h_gbytes_per_sec *= bw_scale
+        if link.h2d_gbytes_per_sec: link.h2d_gbytes_per_sec *= bw_scale
     sim = POLICIES[policy](traces=sampled, arrival_times=arrivals, kv_hbm_gb=kv_hbm_gb,
-                           geom=geom, cost=cost, link=link, **dict(kw))
+                           geom=geom, cost=cost, link=link, **kw)
     sim.run(max_time=max_time)
     s = sim.summary()
     s["label"], s["policy"], s["hbm"], s["seed"], s["rate"] = label, policy, kv_hbm_gb, seed, rate

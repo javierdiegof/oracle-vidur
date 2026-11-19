@@ -473,12 +473,19 @@ class FullConversationOracleSim(TTFTTrackerMixin, BaselineEvictionSim):
 class NaivePagedLRUSim(TTFTTrackerMixin, BaselineEvictionSim):
     """Naive Paged LRU: reactive on-demand reload, evicts deficit tail blocks only."""
 
+    drop_on_evict = False          # True -> evicted blocks are discarded and recomputed (no CPU tier)
+    total_dropped_tokens = 0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, eviction_policy="lru", **kwargs)
         self._init_tracker()
 
     def _force_unpin(self, protect: Live | None) -> bool:
         return self._evict_n_blocks(protect, len(self._vllm_free_blocks) + 1)
+
+    def _lru_victim_key(self, lv: Live):
+        """Victim order (smallest first). LRU = least recently parked."""
+        return lv.parked_at or 0.0
 
     def _evict_n_blocks(self, protect: Live | None, target_needed: int) -> bool:
         evicted_any = False
@@ -497,7 +504,7 @@ class NaivePagedLRUSim(TTFTTrackerMixin, BaselineEvictionSim):
                 ]
             if not candidates:
                 break
-            candidates.sort(key=lambda x: x.parked_at or 0.0)
+            candidates.sort(key=self._lru_victim_key)
             victim = candidates[0]
 
             take = min(deficit, len(victim.vllm_block_ids))
@@ -518,6 +525,15 @@ class NaivePagedLRUSim(TTFTTrackerMixin, BaselineEvictionSim):
                     self._unpin(victim, "evicted")
 
             cache_bytes = take * self.geom.bytes_per_block
+            if self.drop_on_evict:
+                # drop & recompute: no CPU copy; the next admission re-prefills these tokens
+                victim.gpu_cached_tokens = max(0, len(victim.vllm_block_ids) * self.geom.block_tokens)
+                victim.evicted = True
+                self.total_evictions += 1
+                self.total_dropped_tokens += take * self.geom.block_tokens
+                self.forced_unpins += 1
+                evicted_any = True
+                continue
             offload_finish = self.link.submit(cache_bytes, self.now, direction="d2h")
 
             prev = self.offloaded_dram.get(victim.runtime_id)

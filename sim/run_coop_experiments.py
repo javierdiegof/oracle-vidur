@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sim.coop_sim import run_coop_sim  # noqa: E402
 
 TRACE = "data/external_traces/exgentic_swebench.jsonl"
+TRACE_LONG = "data/external_traces/exgentic_browsecompplus.jsonl"   # ~3.4x longer contexts
 N_REQ, MAX_TIME = 40, 8000.0
 SEEDS = [1, 2, 3, 4, 5, 42]
 DEV_SEEDS = [100, 101, 102, 103]                       # tuning only
@@ -99,6 +100,61 @@ EXPERIMENTS = {
         "Coop + guard": ("Coop", dict(COOP, guard_frac=1.0)),
         "Coop sched + guard, LRU repl": ("CoopSchedLRU", dict(COOP_SCHED, guard_frac=1.0)),
     }),
+    # 9. the same baselines with turn-FIFO admission (plain oracle repl): does a cap
+    #    still help once ordering is fair?
+    "fifo": dict(rates=[0.15], seeds=EVAL_SEEDS, configs={
+        "FIFO, no cap": ("Coop", dict(order="age")),
+        "FIFO + cap 300K": ("Coop", dict(order="age", r_cap=R_CAP)),
+        "FIFO + B_cap=12": ("Coop", dict(order="age", b_cap=12)),
+    }),
+    # 10. vLLM-like reference: FCFS turns + plain paged LRU, nothing else added
+    "fifolru": dict(rates=[0.15], seeds=EVAL_SEEDS, configs={
+        "FIFO + LRU, no cap": ("CoopSchedLRU", dict(order="age")),
+        "FIFO + LRU + cap 300K": ("CoopSchedLRU", dict(order="age", r_cap=R_CAP)),
+    }),
+    # 12. long-context workload (BrowseComp+, peak ctx median 117K tok): does replacement matter now?
+    "bcp": dict(rates=[0.15], seeds=EVAL_SEEDS, trace=TRACE_LONG, configs={
+        "Cap Oracle (300K)": ("CapOracle", {"r_cap": R_CAP}),
+        "Uncapped Oracle": ("PagedOracle", {}),
+        "FIFO + LRU, no cap": ("CoopSchedLRU", dict(order="age")),
+        "FIFO, no cap": ("Coop", dict(order="age")),
+        "FIFO + cap 300K": ("Coop", dict(order="age", r_cap=R_CAP)),
+        "FIFO + B_cap=12": ("Coop", dict(order="age", b_cap=12)),
+        "Coop + guard": ("Coop", dict(COOP, guard_frac=1.0)),
+        "Coop sched + guard, LRU repl": ("CoopSchedLRU", dict(COOP_SCHED, guard_frac=1.0)),
+    }),
+    # 13. UPPER BOUND for any replacement policy: FIFO + LRU with ~free KV transfers
+    #     (PCIe x1e4). Labelled as a bound; the hardware model is unchanged elsewhere.
+    "bound": dict(rates=[0.15], seeds=EVAL_SEEDS, configs={
+        "BOUND FIFO + LRU, free reload": ("CoopSchedLRU", dict(order="age", _bw_scale=1e4)),
+    }),
+    "bcpbound": dict(rates=[0.15], seeds=EVAL_SEEDS, trace=TRACE_LONG, configs={
+        "BOUND FIFO + LRU, free reload": ("CoopSchedLRU", dict(order="age", _bw_scale=1e4)),
+    }),
+    # 14. LOWER (adversarial) bound: FIFO + anti-Belady replacement (evict what is needed soonest)
+    "anti": dict(rates=[0.15], seeds=EVAL_SEEDS, configs={
+        "ADVERSARIAL FIFO + anti-oracle": ("CoopSchedAnti", dict(order="age")),
+    }),
+    "bcpanti": dict(rates=[0.15], seeds=EVAL_SEEDS, trace=TRACE_LONG, configs={
+        "ADVERSARIAL FIFO + anti-oracle": ("CoopSchedAnti", dict(order="age")),
+    }),
+    # 15. NO CPU TIER: FIFO + LRU order, evicted KV dropped and re-prefilled (vLLM recompute)
+    "drop": dict(rates=[0.15], seeds=EVAL_SEEDS, configs={
+        "FIFO + drop & recompute": ("CoopSchedDrop", dict(order="age")),
+    }),
+    "bcpdrop": dict(rates=[0.15], seeds=EVAL_SEEDS, trace=TRACE_LONG, max_time=40000.0, configs={
+        "FIFO + drop & recompute": ("CoopSchedDrop", dict(order="age")),
+    }),
+    # 11. the whole FIFO ladder at 128 GB (does anything change with ample HBM?)
+    "hbm128": dict(rates=[0.15], seeds=EVAL_SEEDS, hbms=[128.0], configs={
+        "Cap Oracle (300K)": ("CapOracle", {"r_cap": R_CAP}),
+        "Uncapped Oracle": ("PagedOracle", {}),
+        "FIFO + LRU, no cap": ("CoopSchedLRU", dict(order="age")),
+        "FIFO, no cap": ("Coop", dict(order="age")),
+        "FIFO + cap 300K": ("Coop", dict(order="age", r_cap=R_CAP)),
+        "FIFO + B_cap=12": ("Coop", dict(order="age", b_cap=12)),
+        "Coop + guard": ("Coop", dict(COOP, guard_frac=1.0)),
+    }),
 }
 
 
@@ -107,10 +163,10 @@ def tasks_for(name: str) -> list[tuple]:
     out = []
     for rate in e["rates"]:
         for label, (pol, kw) in e["configs"].items():
-            for hbm in HBMS:
+            for hbm in e.get("hbms", HBMS):
                 for seed in e.get("seeds", SEEDS):
                     key = f"{name}|{label}|{hbm:.0f}|{rate}|{seed}"
-                    out.append((key, pol, hbm, rate, N_REQ, seed, MAX_TIME, TRACE, kw))
+                    out.append((key, pol, hbm, rate, N_REQ, seed, e.get("max_time", MAX_TIME), e.get("trace", TRACE), kw))
     return out
 
 
